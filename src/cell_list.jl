@@ -667,6 +667,10 @@ function _build_sorted_celllist(X::AbstractVector{SVec{T}}, cell::SMat{T},
     # Step 2: Sort atoms by cell ID
     perm = _get_sortperm(cell_ids, backend)
     sorted_cell_ids = cell_ids[perm]
+    # Validate the sort postcondition: the gathered cell IDs must be
+    # non-decreasing. `_get_sortperm` already checked that `perm` is in range;
+    # this catches an in-range result that nonetheless isn't sorted. No-op on CPU.
+    _validate_sorted_by_cell(sorted_cell_ids, backend)
     sorted_X = X[perm]
 
     # Step 3: Compute cell offsets (CSR-style)
@@ -715,10 +719,16 @@ function _get_sortperm(cell_ids::AbstractVector{TI}, backend) where TI
     synchronize(backend)
     # Guard against silent GPU sort failures: on Metal, sortperm! has been
     # observed to return an all-zeros permutation without raising any error
-    # (issue #42), which would silently corrupt the cell list. This O(n)
-    # range check turns that failure mode into a loud error. The reductions
-    # are kept homogeneous in TI: mixed-type accumulators (e.g. a Bool
-    # mapreduce over an Int32 array) fail GPU compilation on Metal.
+    # (issue #42), which would silently corrupt the cell list. This O(n) range
+    # check (negligible beside the O(n log n) sort) turns that into a loud
+    # error, and -- since it runs before the caller gathers `cell_ids[perm]` /
+    # `X[perm]` -- it also guarantees those gathers stay in bounds. We check
+    # explicitly rather than rely on the gather to throw a BoundsError, because
+    # @inbounds-compiled GPU gathers may read out-of-bounds memory instead of
+    # throwing. The reductions are kept homogeneous in TI: mixed-type
+    # accumulators (e.g. a Bool mapreduce over an Int32 array) fail GPU
+    # compilation on Metal. The sort *postcondition* (atoms actually ordered by
+    # cell ID) is checked separately in `_validate_sorted_by_cell`.
     pmin = AcceleratedKernels.reduce(min, perm; init=typemax(TI))
     pmax = AcceleratedKernels.reduce(max, perm; init=typemin(TI))
     if pmin < one(TI) || pmax > TI(n)
@@ -727,6 +737,31 @@ function _get_sortperm(cell_ids::AbstractVector{TI}, backend) where TI
                  As a workaround, build the cell list with backend=CPU().""")
     end
     return perm
+end
+
+# Validate the sort postcondition: `sorted_cell_ids` (== cell_ids[perm]) is
+# non-decreasing. On CPU the built-in `sortperm` is trusted, so this is a no-op.
+_validate_sorted_by_cell(sorted_cell_ids::AbstractVector, backend::CPU) = nothing
+
+# GPU: complements the range check in `_get_sortperm`. A sort that returns an
+# in-range permutation which is nevertheless not sorted (e.g. a partially
+# executed merge on Metal, issue #42) would otherwise corrupt the cell list
+# silently. `max(sorted[k] - sorted[k+1]) <= 0` over adjacent pairs is exactly
+# "non-decreasing"; the broadcast difference and `max` reduction stay
+# homogeneous in TI (positive bounded cell IDs => no overflow) so they compile
+# on Metal. O(n), negligible beside the O(n log n) sort.
+function _validate_sorted_by_cell(sorted_cell_ids::AbstractVector{TI}, backend) where TI
+    n = length(sorted_cell_ids)
+    n < 2 && return nothing
+    maxdrop = AcceleratedKernels.reduce(max,
+        @views(sorted_cell_ids[1:n-1] .- sorted_cell_ids[2:n]); init=typemin(TI))
+    if maxdrop > zero(TI)
+        error("""GPU sort left atoms out of cell-ID order (cell_ids[perm] is not
+                 non-decreasing). This indicates a GPU sort failure (see
+                 NeighbourLists.jl issue #42). As a workaround, build the cell
+                 list with backend=CPU().""")
+    end
+    return nothing
 end
 
 """
